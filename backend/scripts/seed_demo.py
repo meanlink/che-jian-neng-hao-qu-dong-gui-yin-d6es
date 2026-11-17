@@ -2,9 +2,10 @@ import time, json
 from sqlalchemy import select, func
 from src.config.database import Session
 from migrations.initial import migrate
-from src.models import User, Dataset, Job, Report, Delivery, Audit
+from src.models import User, Dataset, Job, Report, Delivery, Audit, ModelVersion, ReleaseConfig, PredictionOrder, PredictionItem
 from src.services.business import metadata, seed_records, analyze
 from src.services.reports import deliver
+from src.services import releases
 from src.utils.security import hash_password
 from src.utils.serialization import checksum
 def seed():
@@ -31,8 +32,14 @@ def seed():
             r=Report(name='每日业务复核简报',job_id=j.id,destination='业务复核组 · 本地收件箱',interval_seconds=86400,next_run=time.time()+86400,enabled=True)
             db.add(r);db.flush();deliver(db,r)
             db.add(Audit(actor='seed',action='demo.baseline',detail={'dataset':d.id},at=time.time()))
+        baseline=db.scalar(select(Job).where(Job.name=='基线复核 · '+m['name']))
+        if baseline and not db.scalar(select(ModelVersion).where(ModelVersion.job_id==baseline.id)):
+            admin=db.scalar(select(User).where(User.role=='admin'))
+            v=releases.seal(db,'基线预测版 · 冲压P01',baseline.id,'演示环境自动封存的基线预测版本',admin)
+            releases.promote(db,v.id,'seed')
+            db.add(Audit(actor='seed',action='version.sealed',detail={'id':v.id,'status':'active'},at=time.time()))
         db.commit()
-        counts={model.__tablename__:db.scalar(select(func.count()).select_from(model)) for model in [User,Dataset,Job,Report,Delivery,Audit]}
+        counts={model.__tablename__:db.scalar(select(func.count()).select_from(model)) for model in [User,Dataset,Job,Report,Delivery,Audit,ModelVersion,ReleaseConfig,PredictionOrder,PredictionItem]}
         print(json.dumps(counts,ensure_ascii=False))
         return counts
 if __name__=='__main__':seed()

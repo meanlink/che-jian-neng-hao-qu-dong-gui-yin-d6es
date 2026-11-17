@@ -8,3 +8,11 @@ class JobStatus(str, Enum):
     running = 'running'
     completed = 'completed'
     failed = 'failed'
+class VersionStatus(str, Enum):
+    pending = 'pending'
+    canary = 'canary'
+    active = 'active'
+    retired = 'retired'
+class Lane(str, Enum):
+    active = 'active'
+    canary = 'canary'

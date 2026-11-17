@@ -55,7 +55,8 @@ def _bounded(value, name, low, high):
     return value
 
 
-def analyze(records, params):
+def _train(records, params):
+    """Validate records, search features/alpha by time-series CV, fit the final model."""
     if not isinstance(records, list) or len(records) < 70:
         raise ValueError("至少需要70天能耗记录，以保留时间验证窗")
     k = _bounded(params.get("max_features", 4), "解释变量数", 2, 4)
@@ -99,6 +100,13 @@ def analyze(records, params):
     cv_rmse, features, alpha = best
     model = make_pipeline(StandardScaler(), Ridge(alpha=alpha))
     model.fit(x[:cut][:, features], y[:cut])
+    return {"parsed": parsed, "x": x, "y": y, "cut": cut, "delta": delta, "cv_rmse": cv_rmse, "features": features, "alpha": alpha, "model": model}
+
+
+def analyze(records, params):
+    t = _train(records, params)
+    parsed, x, y, cut = t["parsed"], t["x"], t["y"], t["cut"]
+    delta, cv_rmse, features, alpha, model = t["delta"], t["cv_rmse"], t["features"], t["alpha"], t["model"]
     predictions = model.predict(x[cut:][:, features])
     rmse = float(mean_squared_error(y[cut:], predictions) ** 0.5)
     r2_defined = float(np.std(y[cut:])) > 1e-9
@@ -127,3 +135,59 @@ def analyze(records, params):
         "findings": [f"选定岭惩罚α={alpha:g}；训练内交叉验证RMSE={cv_rmse:.3f}kWh。", f"最近14天平均特征对应基准日电耗{base_kwh:.2f}kWh，情景差额{scenario_kwh-base_kwh:+.2f}kWh。", "每折的标准化器仅在该折训练部分拟合；最后20%记录未参与变量和α选择。", "系数已还原到原始单位，解释为其他入选变量不变时的条件关联。"],
         "method": metadata()["method"], "warnings": warnings,
     }
+
+
+def model_artifact(records, params):
+    """Snapshot the trained model into a JSON-serializable dict sealed at version creation.
+
+    The artifact is the complete calculation basis for online prediction; it never
+    changes afterwards, even if new experiments are trained later.
+    """
+    t = _train(records, params)
+    x, y, cut = t["x"], t["y"], t["cut"]
+    features, model = t["features"], t["model"]
+    scaler = model.named_steps["standardscaler"]
+    ridge = model.named_steps["ridge"]
+    keys = list(FEATURES)
+    selected = [keys[index] for index in features]
+    artifact = {
+        "feature_keys": selected,
+        "alpha": float(t["alpha"]),
+        "scaler_mean": [float(v) for v in scaler.mean_],
+        "scaler_scale": [float(v) for v in scaler.scale_],
+        "coefficients": [float(v) for v in ridge.coef_],
+        "intercept": float(ridge.intercept_),
+        "train_window": {"days": len(t["parsed"]), "train_days": int(cut), "from": str(t["parsed"][0][0]), "to": str(t["parsed"][-1][0])},
+        "train_ranges": {keys[index]: [float(x[:cut, index].min()), float(x[:cut, index].max())] for index in features},
+        "params": {key: params[key] for key in sorted(params)},
+    }
+    holdout = [predict_one(artifact, dict(zip(keys, row))) for row in x[cut:]]
+    artifact["validation"] = {
+        "rmse": round(float(np.mean([(y[i] - holdout[i - cut][0]) ** 2 for i in range(cut, len(y))]) ** 0.5), 6),
+        "holdout_days": int(len(y) - cut),
+    }
+    return artifact
+
+
+def predict_one(artifact, item):
+    """Predict daily kwh for one scheduling item from a sealed artifact. Returns (kwh, flags)."""
+    keys = list(FEATURES)
+    try:
+        vector = [float(item[key]) for key in keys]
+    except (KeyError, TypeError, ValueError):
+        raise ValueError("排产明细必须包含日产量、运行小时、环境温度和待机小时数值") from None
+    if not all(math.isfinite(value) for value in vector):
+        raise ValueError("排产明细不能包含缺失、NaN或无穷")
+    if not (0 <= vector[0] <= 10_000_000 and 0 <= vector[1] <= 24 and -100 <= vector[2] <= 100 and 0 <= vector[3] <= 24):
+        raise ValueError("日产量须在0至1000万，运行/待机小时0至24，温度−100至100℃")
+    selected = artifact["feature_keys"]
+    values = [vector[keys.index(key)] for key in selected]
+    z = [(value - mean) / scale for value, mean, scale in zip(values, artifact["scaler_mean"], artifact["scaler_scale"])]
+    kwh = float(artifact["intercept"]) + sum(coef * zi for coef, zi in zip(artifact["coefficients"], z))
+    ranges = artifact.get("train_ranges", {})
+    flags = []
+    if any(key in ranges and (value < ranges[key][0] or value > ranges[key][1]) for key, value in zip(selected, values)):
+        flags.append("超出训练范围")
+    if kwh < 0:
+        flags.append("负电耗外推")
+    return round(kwh, 2), flags
